@@ -65,6 +65,7 @@ The first voice run downloads two small speech models (about 190 MB in total), o
 - `--ptt`: press Enter instead of saying the wake word. Use this if the wake word is unreliable in a noisy room.
 - `--announce`: says "Let me think harder…" when Opus is answering, so you know why it's taking longer.
 - `--no-web`: turns off web searches.
+- `--debug`: shows what's happening behind the scenes: when the wake word is heard, the noise threshold, how long recording, transcription, each Claude call and speaking take, token usage, and what Claude searched for. It's also saved to `~/.hey-claude/debug.log` (this file contains your questions and answers, and stays on your computer).
 - `--tts kokoro`: a much more natural-sounding voice that runs on your computer. The first run downloads about 120 MB, one time only. Pick a voice with `--voice` (e.g. `af_heart`, `af_bella`, `am_michael`; `--tts kokoro --list-voices` shows all).
 - `--name Quinn`: after "Hey Leo" it says "Yes, Quinn" before the beep. You can also set the `HEY_CLAUDE_NAME` environment variable. Without a name it says "Yes?".
 - `--voice Samantha`: chooses a voice. Run `--list-voices` to see what's installed. On a Mac, better voices can be downloaded under System Settings → Accessibility → Spoken Content.

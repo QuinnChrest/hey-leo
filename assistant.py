@@ -22,6 +22,7 @@ Options:
   --voice NAME   pick a text-to-speech voice (run with --list-voices to see them)
   --tts kokoro   natural-sounding local voice instead of the system voices
   --name NAME    after the wake word it replies "Yes, NAME" (or set HEY_CLAUDE_NAME)
+  --debug        show timings, token use, wake-word and web-search details (also logged to a file)
 """
 
 import argparse
@@ -33,6 +34,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -66,6 +68,34 @@ VOSK_DIR = APP_DIR / "vosk-model-small-en-us-0.15"
 KOKORO_BASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
 KOKORO_FILES = ["kokoro-v1.0.int8.onnx", "voices-v1.0.bin"]   # about 120 MB total
 KOKORO_DEFAULT_VOICE = "am_michael"   # others to try: am_onyx, am_liam, bm_daniel
+
+DEBUG = False
+LOG_FILE = APP_DIR / "debug.log"
+
+
+def dbg(msg):
+    """Debug output: printed to the terminal and appended to LOG_FILE. Only active with --debug."""
+    if not DEBUG:
+        return
+    print(f"  [debug] {msg}")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def enable_debug():
+    global DEBUG
+    DEBUG = True
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    dbg(f"--- debug session started (log file: {LOG_FILE}) ---")
+
+
+def usage_str(resp):
+    u = getattr(resp, "usage", None)
+    return f"{getattr(u, 'input_tokens', '?')} in / {getattr(u, 'output_tokens', '?')} out tokens"
+
 
 ANSWER_SYSTEM = """You are Leo, a voice assistant. Your answer will be read aloud by a \
 text-to-speech engine, so:
@@ -126,6 +156,7 @@ class Brain:
 
     def route(self, question):
         try:
+            t = time.time()
             resp = self.client.messages.create(
                 model=ROUTER_MODEL,
                 max_tokens=200,
@@ -136,6 +167,7 @@ class Brain:
             )
             for block in resp.content:
                 if block.type == "tool_use":
+                    dbg(f"router ({ROUTER_MODEL}): {time.time() - t:.2f}s, {usage_str(resp)}, result={block.input}")
                     return block.input
         except anthropic.APIError as e:
             if is_fatal(e):          # no point falling back; the answer call would fail the same way
@@ -163,7 +195,12 @@ class Brain:
         convo = list(messages)
         try:
             for _ in range(4):  # web search can pause a long turn; continue it
+                t = time.time()
                 resp = self.client.messages.create(messages=convo, **kwargs)
+                dbg(f"{model}: {time.time() - t:.2f}s, stop={resp.stop_reason}, {usage_str(resp)}")
+                for b in resp.content:
+                    if b.type == "server_tool_use":
+                        dbg(f"web search: {getattr(b, 'input', {}).get('query')!r}")
                 if resp.stop_reason != "pause_turn":
                     break
                 convo = convo + [{"role": "assistant", "content": resp.content}]
@@ -315,7 +352,9 @@ class Ears:
         print("Measuring background noise, stay quiet for a second...")
         levels = [self._rms(self.q.get()) for _ in range(10)]
         ambient = sum(levels) / len(levels)
-        return max(ambient * 2.5, 300.0)
+        threshold = max(ambient * 2.5, 300.0)
+        dbg(f"background noise level {ambient:.0f}, speech threshold {threshold:.0f}")
+        return threshold
 
     def flush(self):
         while not self.q.empty():
@@ -349,6 +388,7 @@ class Ears:
             else:
                 heard = json.loads(rec.PartialResult()).get("partial", "")
             if any(p in heard for p in WAKE_PHRASES):
+                dbg(f"wake word heard: {heard!r}")
                 return
 
     def record_question(self):
@@ -365,18 +405,24 @@ class Ears:
                     started = True
                     frames.append(chunk)
                 elif elapsed > WAIT_FOR_SPEECH_SECONDS:
+                    dbg(f"no speech within {WAIT_FOR_SPEECH_SECONDS}s (threshold {self.threshold:.0f})")
                     return None
                 continue
             frames.append(chunk)
             quiet = 0.0 if loud else quiet + step
             if quiet >= SILENCE_TO_STOP:
                 break
+        dbg(f"recorded {len(frames) * step:.1f}s of audio, ended by "
+            f"{'silence' if quiet >= SILENCE_TO_STOP else 'the time limit'}")
         return b"".join(frames)
 
     def transcribe(self, audio):
         a = self.np.frombuffer(audio, dtype=self.np.int16).astype(self.np.float32) / 32768.0
+        t = time.time()
         segments, _ = self.whisper.transcribe(a, language="en", beam_size=1, vad_filter=True)
-        return " ".join(s.text for s in segments).strip()
+        text = " ".join(s.text for s in segments).strip()
+        dbg(f"transcribed in {time.time() - t:.2f}s: {text!r}")
+        return text
 
 
 def ensure_vosk_model():
@@ -412,9 +458,13 @@ def handle(question, brain, voice, ears, announce):
         reply = brain.answer(question, tier, route.get("needs_web", False))
     except anthropic.APIError as e:
         print(f"  error: {e}")
+        dbg(f"API error: {type(e).__name__}, status={getattr(e, 'status_code', None)}, "
+            f"request_id={getattr(e, 'request_id', None)}")
         reply = spoken_error(e)
     print(f"Claude ({time.time() - started:.1f}s): {reply}")
+    t = time.time()
     speak(speakable(reply), voice, ears)
+    dbg(f"spoken in {time.time() - t:.1f}s")
 
 
 def speak(text, voice, ears, cache=False):
@@ -438,10 +488,17 @@ def main():
     p.add_argument("--name", default=os.environ.get("HEY_CLAUDE_NAME"),
                    help='your name; after the wake word it says "Yes, <name>" (or set HEY_CLAUDE_NAME)')
     p.add_argument("--list-voices", action="store_true")
+    p.add_argument("--debug", action="store_true",
+                   help=f"show timings, token use, wake-word and web-search details; also logs to {LOG_FILE}")
     p.add_argument("--test-voice", action="store_true",
                    help="just speak a sample and exit (no API key or microphone needed)")
     args = p.parse_args()
 
+    if args.debug:
+        enable_debug()
+        dbg(f"python {platform.python_version()} on {platform.system()}; "
+            f"mode={'text' if args.text else 'ptt' if args.ptt else 'wake word'}, tts={args.tts}, "
+            f"voice={args.voice}, web={'off' if args.no_web else 'on'}, whisper={WHISPER_SIZE}")
     voice = Voice(args.voice, args.tts)
     if args.list_voices:
         voice.list_voices()
@@ -498,3 +555,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nBye!")
+    except Exception:
+        dbg("crashed:\n" + traceback.format_exc())
+        raise

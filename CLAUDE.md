@@ -30,6 +30,10 @@ Pipeline: wake word -> record -> transcribe -> route -> answer -> speak. The pie
 - **`Voice`**: `--tts system` (default) is macOS `say`, otherwise `pyttsx3`; `--tts kokoro` is local neural TTS via `kokoro-onnx` (model files auto-download to `~/.hey-claude/`). After the wake word, `main` speaks a greeting ("Yes, <name>." from `--name` / `HEY_CLAUDE_NAME`) before the beep; with kokoro it is pre-rendered at startup. `speakable()` strips markdown, URLs and code before TTS.
 - **`handle` / `speak` / `main`**: `speak` mutes the mic while TTS or beeps play so the assistant doesn't hear itself. `--text` mode passes `ears=None` and skips all audio input.
 
+## Debugging
+
+`--debug` turns on `dbg()` (prints `[debug] ...` and appends to `~/.hey-claude/debug.log`). New instrumentation should go through `dbg()` so it stays silent by default.
+
 ## Tuning
 
 Behavior knobs (`ROUTER_SYSTEM`, `ANSWER_SYSTEM`, `WAKE_PHRASES`, `WHISPER_SIZE`, `SILENCE_TO_STOP`, `MODELS`) are constants at the top of `assistant.py`. `ANSWER_SYSTEM` is written for text-to-speech (no markdown, short answers), so keep answers speakable if you edit it.
