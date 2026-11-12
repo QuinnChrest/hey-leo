@@ -1,0 +1,7 @@
+anthropic>=0.40
+sounddevice
+numpy
+vosk
+faster-whisper
+kokoro-onnx
+pyttsx3; sys_platform != "darwin"
