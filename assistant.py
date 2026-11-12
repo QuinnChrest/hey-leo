@@ -138,6 +138,8 @@ class Brain:
                 if block.type == "tool_use":
                     return block.input
         except anthropic.APIError as e:
+            if is_fatal(e):          # no point falling back; the answer call would fail the same way
+                raise
             print(f"  (router error, defaulting to sonnet: {e})")
         return {"model": "sonnet", "needs_web": False, "reason": "fallback"}
 
@@ -166,12 +168,37 @@ class Brain:
                     break
                 convo = convo + [{"role": "assistant", "content": resp.content}]
         except anthropic.BadRequestError as e:
-            if use_web:
+            if use_web and not is_fatal(e):
                 print(f"  (web search unavailable, answering without it: {e.message})")
                 return self._ask(model, system, messages, use_web=False)
             raise
         # When web search is used, the answer arrives in several text blocks; join them.
         return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+def is_out_of_credits(e):
+    return isinstance(e, anthropic.BadRequestError) and "credit balance" in str(e).lower()
+
+
+def is_fatal(e):
+    """Errors that retrying or falling back can't fix."""
+    return is_out_of_credits(e) or isinstance(e, anthropic.AuthenticationError)
+
+
+def spoken_error(e):
+    """What Leo says out loud when a Claude call fails."""
+    if is_out_of_credits(e):
+        return ("I can't answer because your Anthropic account is out of credits. "
+                "Add more at console dot anthropic dot com, under Billing.")
+    if isinstance(e, anthropic.AuthenticationError):
+        return "Your Anthropic API key was rejected. Check that it's set correctly."
+    if isinstance(e, anthropic.PermissionDeniedError):
+        return "Your Anthropic API key doesn't have permission to use that model."
+    if isinstance(e, anthropic.RateLimitError):
+        return "I'm being rate limited right now. Try again in a moment."
+    if isinstance(e, anthropic.APIConnectionError):
+        return "I couldn't reach Claude. Check your internet connection."
+    return "Sorry, I couldn't reach Claude just now."
 
 
 def speakable(text):
@@ -369,22 +396,23 @@ def ensure_vosk_model():
 
 def handle(question, brain, voice, ears, announce):
     print(f"\nYou: {question}")
-    route = brain.route(question)
-    tier = route.get("model", "sonnet")
-    if tier not in MODELS:
-        tier = "sonnet"
-    web = " + web" if route.get("needs_web") and brain.allow_web else ""
-    print(f"  -> {tier}{web}  ({route.get('reason', '')})")
-
-    if announce and ANNOUNCEMENTS[tier]:
-        speak(ANNOUNCEMENTS[tier], voice, ears)
-
     started = time.time()
     try:
+        route = brain.route(question)
+        tier = route.get("model", "sonnet")
+        if tier not in MODELS:
+            tier = "sonnet"
+        web = " + web" if route.get("needs_web") and brain.allow_web else ""
+        print(f"  -> {tier}{web}  ({route.get('reason', '')})")
+
+        if announce and ANNOUNCEMENTS[tier]:
+            speak(ANNOUNCEMENTS[tier], voice, ears)
+
+        started = time.time()
         reply = brain.answer(question, tier, route.get("needs_web", False))
     except anthropic.APIError as e:
         print(f"  error: {e}")
-        reply = "Sorry, I couldn't reach Claude just now."
+        reply = spoken_error(e)
     print(f"Claude ({time.time() - started:.1f}s): {reply}")
     speak(speakable(reply), voice, ears)
 
