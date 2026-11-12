@@ -30,6 +30,14 @@ Pipeline: wake word -> record -> transcribe -> route -> answer -> speak. The pie
 - **`Voice`**: `--tts system` (default) is macOS `say`, otherwise `pyttsx3`; `--tts kokoro` is local neural TTS via `kokoro-onnx` (model files auto-download to `~/.hey-claude/`). After the wake word, `main` speaks a greeting ("Yes, <name>." from `--name` / `HEY_CLAUDE_NAME`) before the beep; with kokoro it is pre-rendered at startup. `speakable()` strips markdown, URLs and code before TTS.
 - **`handle` / `speak` / `main`**: `speak` mutes the mic while TTS or beeps play so the assistant doesn't hear itself. `--text` mode passes `ears=None` and skips all audio input.
 
+## Stopping speech
+
+The mic is muted while Leo talks (to avoid hearing itself), so stopping is a global hotkey (`STOP_HOTKEY`, via `pynput`) that sets the `_stop` event. `Voice.say()` polls it and returns True when cut short; `speak()`, `handle()` and the main loop use that to skip the rest of the turn. `_stop` is cleared at the start of each turn, not inside `say()`, so a press while Leo is still thinking cancels the spoken reply.
+
+## Conversation log
+
+Separate from `--debug`, every question is appended as one JSON object per line to `~/.hey-claude/conversations/YYYY-MM.jsonl` (monthly files keep each one small), unless `--no-log`. `Brain` collects per-call stats in `brain.trace` (reset by `handle()`), and `handle()` builds the record and calls `log_turn()` on every exit path. The entry has a `"v": 1` schema version; bump it if fields change meaning.
+
 ## Debugging
 
 `--debug` turns on `dbg()` (prints `[debug] ...` and appends to `~/.hey-claude/debug.log`). New instrumentation should go through `dbg()` so it stays silent by default.

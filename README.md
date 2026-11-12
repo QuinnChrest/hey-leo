@@ -77,7 +77,18 @@ You: why do cats purr
 Claude (2.1s): Cats purr by rapidly twitching the muscles in their voice box...
 ```
 
+**Stopping Leo:** if it wakes up by mistake or starts talking and you don't want it to, press **Ctrl + Alt + S**. It works from any window, even if you're in a game. Leo stops talking right away, skips the rest of that turn (no answer is requested if it hasn't been yet), and goes back to waiting for "Hey Leo". Change the key combination with `STOP_HOTKEY` at the top of `assistant.py`. On a Mac, you'll need to allow Terminal under System Settings → Privacy & Security → Input Monitoring.
+
 Follow-up questions work: "How about dogs?" remembers what you just asked, for up to 5 minutes.
+
+## Conversation log
+
+Every question and answer is saved on your computer, one file per month, in `~/.hey-claude/conversations/` (for example `2026-11.jsonl`). Each line is one question as JSON: what you asked, which model Haiku picked and why, the answer and its word count, the web searches used, input and output tokens for every call, how long each step took, and whether the answer was stopped by you or cut off by the length limit (`"truncated": true`). Nothing is uploaded. Use `--no-log` to turn it off, and delete the files any time.
+
+To see how long answers actually are, in PowerShell:
+```powershell
+Get-Content ~\.hey-claude\conversations\*.jsonl | ForEach-Object { $_ | ConvertFrom-Json } | Select-Object time, tier, answer_words, truncated, question
+```
 
 ## Tweaking
 
@@ -86,6 +97,8 @@ Everything you'd want to change is at the top of `assistant.py`:
 - `ROUTER_SYSTEM`: the rules Haiku uses to pick a model. Edit these if it sends too much to Opus, or too little.
 - `ANSWER_SYSTEM`: how answers should sound (length, style).
 - `WAKE_PHRASES`: add your own wake phrases.
+- `WAKE_DECOYS`: similar-sounding phrases ("hello", "hey you"…) that the wake-word recognizer should recognize as *not* the wake phrase. If it wakes up to something by mistake, add that phrase here. Run with `--debug` to see what it ignored.
+- `GREETING_PAUSE`: the pause between hearing "Hey Leo" and the "Yes, Quinn" reply.
 - `WHISPER_SIZE`: `tiny.en` is faster, `small.en` is more accurate.
 - `SILENCE_TO_STOP`: raise it if it cuts you off mid-sentence.
 

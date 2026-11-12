@@ -22,6 +22,7 @@ Options:
   --voice NAME   pick a text-to-speech voice (run with --list-voices to see them)
   --tts kokoro   natural-sounding local voice instead of the system voices
   --name NAME    after the wake word it replies "Yes, NAME" (or set HEY_CLAUDE_NAME)
+  --no-log       don't save questions and answers (normally kept in ~/.hey-claude/conversations/)
   --debug        show timings, token use, wake-word and web-search details (also logged to a file)
 """
 
@@ -33,6 +34,7 @@ import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import zipfile
@@ -51,7 +53,13 @@ MODELS = {
 ROUTER_MODEL = MODELS["haiku"]
 
 BOT_NAME = "Leo"
-WAKE_PHRASES = ["hey leo", "okay leo"]
+WAKE_PHRASES = ["hey leo"]
+# Similar-sounding phrases. The wake-word recognizer can only output words it is given, so
+# without these it forces "hello" or "hey you" into "hey leo". Add any phrase that triggers it by mistake.
+WAKE_DECOYS = ["hello", "hey", "okay", "leo", "hey lee", "hey leon", "hey you", "hey there",
+               "hey google", "hey claude", "hey siri", "hey alexa", "hello leo", "yo leo"]
+STOP_HOTKEY = "<ctrl>+<alt>+s"   # global: works from any window. Stops Leo mid-sentence.
+GREETING_PAUSE = 0.3             # seconds between hearing the wake word and replying "Yes, Quinn"
 WHISPER_SIZE = "base.en"          # "tiny.en" is faster, "small.en" is more accurate
 SAMPLE_RATE = 16000
 CHUNK = 1600                      # 100 ms of audio per chunk
@@ -90,6 +98,55 @@ def enable_debug():
     DEBUG = True
     APP_DIR.mkdir(parents=True, exist_ok=True)
     dbg(f"--- debug session started (log file: {LOG_FILE}) ---")
+
+
+_stop = threading.Event()        # set by the stop hotkey; cleared at the start of each turn
+
+
+def start_stop_hotkey():
+    """Listen for STOP_HOTKEY from any window (the mic is muted while Leo talks, so
+    stopping by voice isn't possible)."""
+    try:
+        from pynput import keyboard
+        hk = keyboard.GlobalHotKeys({STOP_HOTKEY: _stop.set})
+        hk.daemon = True
+        hk.start()
+        key = STOP_HOTKEY.replace("<", "").replace(">", "").replace("+", " + ").title()
+        print(f"Press {key} to stop Leo if it speaks by mistake.")
+    except Exception as e:
+        print(f"  (stop hotkey unavailable: {e})")
+
+
+CONV_DIR = APP_DIR / "conversations"   # one JSON Lines file per month: 2026-11.jsonl
+LOG_CONVERSATIONS = True               # turned off by --no-log
+RUN_MODE = "wake"                      # "wake", "ptt" or "text"; recorded in each log entry
+
+
+def new_trace():
+    return {"calls": [], "searches": [], "history_turns": None}
+
+
+def log_turn(rec, brain):
+    """Append one finished question/answer to this month's JSON Lines file."""
+    if not LOG_CONVERSATIONS:
+        return
+    calls = brain.trace["calls"]
+    rec["answer_words"] = len(rec["answer"].split()) if rec.get("answer") else None
+    rec["web_searches"] = brain.trace["searches"]
+    rec["history_turns"] = brain.trace["history_turns"]
+    rec["calls"] = calls
+    rec["totals"] = {
+        "input_tokens": sum(c["input_tokens"] or 0 for c in calls),
+        "output_tokens": sum(c["output_tokens"] or 0 for c in calls),
+    }
+    rec["truncated"] = any(c["stop_reason"] == "max_tokens" for c in calls)   # answer cut off by the limit
+    try:
+        CONV_DIR.mkdir(parents=True, exist_ok=True)
+        path = CONV_DIR / f"{time.strftime('%Y-%m')}.jsonl"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"  (couldn't save conversation log: {e})")
 
 
 def usage_str(resp):
@@ -153,6 +210,18 @@ class Brain:
         self.allow_web = allow_web
         self.history = []
         self.last_turn = 0.0
+        self.trace = new_trace()     # per-question stats, reset by handle() and saved by log_turn()
+
+    def _record_call(self, role, model, started, resp):
+        u = getattr(resp, "usage", None)
+        self.trace["calls"].append({
+            "role": role,
+            "model": model,
+            "seconds": round(time.time() - started, 2),
+            "input_tokens": getattr(u, "input_tokens", None),
+            "output_tokens": getattr(u, "output_tokens", None),
+            "stop_reason": resp.stop_reason,
+        })
 
     def route(self, question):
         try:
@@ -165,6 +234,7 @@ class Brain:
                 tool_choice={"type": "tool", "name": "route"},
                 messages=[{"role": "user", "content": question}],
             )
+            self._record_call("router", ROUTER_MODEL, t, resp)
             for block in resp.content:
                 if block.type == "tool_use":
                     dbg(f"router ({ROUTER_MODEL}): {time.time() - t:.2f}s, {usage_str(resp)}, result={block.input}")
@@ -178,6 +248,7 @@ class Brain:
     def answer(self, question, tier, needs_web):
         if time.time() - self.last_turn > MEMORY_MINUTES * 60:
             self.history = []
+        self.trace["history_turns"] = len(self.history) // 2
         messages = self.history + [{"role": "user", "content": question}]
         system = ANSWER_SYSTEM.format(now=time.strftime("%A, %B %d, %Y, %I:%M %p"))
         use_web = self.allow_web and needs_web
@@ -198,9 +269,12 @@ class Brain:
                 t = time.time()
                 resp = self.client.messages.create(messages=convo, **kwargs)
                 dbg(f"{model}: {time.time() - t:.2f}s, stop={resp.stop_reason}, {usage_str(resp)}")
+                self._record_call("answer", model, t, resp)
                 for b in resp.content:
                     if b.type == "server_tool_use":
-                        dbg(f"web search: {getattr(b, 'input', {}).get('query')!r}")
+                        query = getattr(b, "input", {}).get("query")
+                        self.trace["searches"].append(query)
+                        dbg(f"web search: {query!r}")
                 if resp.stop_reason != "pause_turn":
                     break
                 convo = convo + [{"role": "assistant", "content": resp.content}]
@@ -269,6 +343,8 @@ class Voice:
             import pyttsx3
             self.engine = pyttsx3.init()
             self.engine.setProperty("rate", 185)
+            self.engine.connect("started-word", lambda name, location, length:
+                                self.engine.stop() if _stop.is_set() else None)
             if voice_name:
                 for v in self.engine.getProperty("voices"):
                     if voice_name.lower() in v.name.lower():
@@ -291,8 +367,11 @@ class Voice:
         return self.kokoro.create(text, voice=self.voice_name, speed=1.05, lang="en-us")
 
     def say(self, text, cache=False):
+        """Speak text. Returns True if the stop hotkey cut it short (or had already been pressed)."""
         if not text:
-            return
+            return False
+        if _stop.is_set():
+            return True
         if self.kokoro_mode:
             import sounddevice as sd
             if cache and text in self._cache:
@@ -301,14 +380,28 @@ class Voice:
                 samples, rate = self._synthesize(text)
                 if cache:
                     self._cache[text] = (samples, rate)
+            if _stop.is_set():
+                return True
             sd.play(samples, rate)
+            end = time.time() + len(samples) / rate
+            while time.time() < end + 0.1:
+                if _stop.is_set():
+                    sd.stop()
+                    return True
+                time.sleep(0.03)
             sd.wait()
         elif self.mac:
             cmd = ["say"] + (["-v", self.voice_name] if self.voice_name else []) + [text]
-            subprocess.run(cmd)
+            proc = subprocess.Popen(cmd)
+            while proc.poll() is None:
+                if _stop.is_set():
+                    proc.terminate()
+                    return True
+                time.sleep(0.03)
         else:
             self.engine.say(text)
-            self.engine.runAndWait()
+            self.engine.runAndWait()      # the started-word callback stops it if _stop is set
+        return _stop.is_set()
 
     def list_voices(self):
         if self.kokoro_mode:
@@ -379,17 +472,18 @@ class Ears:
         SetLogLevel(-1)
         if not hasattr(self, "vosk"):
             self.vosk = Model(str(ensure_vosk_model()))
-        rec = KaldiRecognizer(self.vosk, SAMPLE_RATE, json.dumps(WAKE_PHRASES + ["[unk]"]))
+        rec = KaldiRecognizer(self.vosk, SAMPLE_RATE, json.dumps(WAKE_PHRASES + WAKE_DECOYS + ["[unk]"]))
         self.flush()
         while True:
             chunk = self.q.get()
-            if rec.AcceptWaveform(chunk):
-                heard = json.loads(rec.Result()).get("text", "")
-            else:
-                heard = json.loads(rec.PartialResult()).get("partial", "")
-            if any(p in heard for p in WAKE_PHRASES):
+            if not rec.AcceptWaveform(chunk):
+                continue    # judge finished utterances only; partial results flicker and cause false triggers
+            heard = json.loads(rec.Result()).get("text", "")
+            if is_wake(heard):
                 dbg(f"wake word heard: {heard!r}")
                 return
+            if heard and heard != "[unk]":
+                dbg(f"ignored (not the wake phrase): {heard!r}")
 
     def record_question(self):
         """Record from now until the speaker goes quiet. Returns raw audio bytes or None."""
@@ -398,6 +492,8 @@ class Ears:
         step = CHUNK / SAMPLE_RATE
         while elapsed < MAX_QUESTION_SECONDS:
             chunk = self.q.get()
+            if _stop.is_set():
+                return None
             elapsed += step
             loud = self._rms(chunk) > self.threshold
             if not started:
@@ -425,6 +521,12 @@ class Ears:
         return text
 
 
+def is_wake(heard):
+    """True if the utterance starts with the wake phrase. Speech before it (a conversation
+    in the room) doesn't count, and neither does a longer word like "hey leon"."""
+    return any((heard + " ").startswith(p + " ") for p in WAKE_PHRASES)
+
+
 def ensure_vosk_model():
     if VOSK_DIR.exists():
         return VOSK_DIR
@@ -442,41 +544,69 @@ def ensure_vosk_model():
 
 def handle(question, brain, voice, ears, announce):
     print(f"\nYou: {question}")
+    brain.trace = new_trace()
+    rec = {"v": 1, "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": RUN_MODE, "question": question,
+           "route": None, "tier": None, "answer": None, "stopped": False, "error": None, "seconds": {}}
+    if _stop.is_set():
+        print("  (stopped)")
+        rec["stopped"] = True
+        log_turn(rec, brain)
+        return
     started = time.time()
     try:
+        t = time.time()
         route = brain.route(question)
+        rec["seconds"]["route"] = round(time.time() - t, 2)
+        rec["route"] = route
         tier = route.get("model", "sonnet")
         if tier not in MODELS:
             tier = "sonnet"
+        rec["tier"] = tier
         web = " + web" if route.get("needs_web") and brain.allow_web else ""
         print(f"  -> {tier}{web}  ({route.get('reason', '')})")
 
         if announce and ANNOUNCEMENTS[tier]:
             speak(ANNOUNCEMENTS[tier], voice, ears)
+        if _stop.is_set():          # stopped while routing: don't spend credits on an answer
+            print("  (stopped)")
+            rec["stopped"] = True
+            log_turn(rec, brain)
+            return
 
         started = time.time()
         reply = brain.answer(question, tier, route.get("needs_web", False))
+        rec["seconds"]["answer"] = round(time.time() - started, 2)
+        rec["answer"] = reply
     except anthropic.APIError as e:
         print(f"  error: {e}")
         dbg(f"API error: {type(e).__name__}, status={getattr(e, 'status_code', None)}, "
             f"request_id={getattr(e, 'request_id', None)}")
+        rec["error"] = {"type": type(e).__name__, "status": getattr(e, "status_code", None),
+                        "message": str(e)[:300]}
         reply = spoken_error(e)
     print(f"Claude ({time.time() - started:.1f}s): {reply}")
     t = time.time()
-    speak(speakable(reply), voice, ears)
-    dbg(f"spoken in {time.time() - t:.1f}s")
+    rec["stopped"] = speak(speakable(reply), voice, ears)
+    if rec["stopped"]:
+        print("  (stopped)")
+    rec["seconds"]["speak"] = round(time.time() - t, 2)
+    dbg(f"spoken in {rec['seconds']['speak']:.1f}s")
+    log_turn(rec, brain)
 
 
 def speak(text, voice, ears, cache=False):
+    """Speak with the mic muted. Returns True if the user stopped it."""
     if ears:
         ears.mute(True)
-    voice.say(text, cache=cache)
+    stopped = voice.say(text, cache=cache)
     if ears:
         time.sleep(0.2)
         ears.mute(False)
+    return stopped
 
 
 def main():
+    global LOG_CONVERSATIONS, RUN_MODE
     p = argparse.ArgumentParser(description="Hey Leo voice assistant")
     p.add_argument("--ptt", action="store_true", help="push-to-talk instead of wake word")
     p.add_argument("--text", action="store_true", help="type questions instead of speaking")
@@ -488,12 +618,16 @@ def main():
     p.add_argument("--name", default=os.environ.get("HEY_CLAUDE_NAME"),
                    help='your name; after the wake word it says "Yes, <name>" (or set HEY_CLAUDE_NAME)')
     p.add_argument("--list-voices", action="store_true")
+    p.add_argument("--no-log", action="store_true",
+                   help=f"don't save questions and answers to {CONV_DIR}")
     p.add_argument("--debug", action="store_true",
                    help=f"show timings, token use, wake-word and web-search details; also logs to {LOG_FILE}")
     p.add_argument("--test-voice", action="store_true",
                    help="just speak a sample and exit (no API key or microphone needed)")
     args = p.parse_args()
 
+    LOG_CONVERSATIONS = not args.no_log
+    RUN_MODE = "text" if args.text else "ptt" if args.ptt else "wake"
     if args.debug:
         enable_debug()
         dbg(f"python {platform.python_version()} on {platform.system()}; "
@@ -513,12 +647,14 @@ def main():
             voice.say(line)
         return
     brain = Brain(allow_web=not args.no_web)
+    start_stop_hotkey()
 
     if args.text:
         print("Type a question (Ctrl+C to quit).")
         while True:
             q = input("\n> ").strip()
             if q:
+                _stop.clear()
                 handle(q, brain, voice, None, args.announce)
 
     greeting = f"Yes, {args.name}." if args.name else "Yes?"
@@ -533,13 +669,21 @@ def main():
     while True:
         if args.ptt:
             input()
+            _stop.clear()
         else:
             ears.wait_for_wake_word()
-            speak(greeting, voice, ears, cache=True)
+            _stop.clear()
+            time.sleep(GREETING_PAUSE)
+            if speak(greeting, voice, ears, cache=True):
+                print("  (stopped)")
+                continue
         ears.beep(880)
         print("Listening...")
         audio = ears.record_question()
         ears.beep(660, 80)
+        if _stop.is_set():
+            print("  (stopped)")
+            continue
         if not audio:
             print("  (didn't hear anything)")
             continue
