@@ -5,4 +5,5 @@ vosk
 faster-whisper
 kokoro-onnx
 pynput
+pygame                   # only for --viz pygame
 pyttsx3; sys_platform != "darwin"

@@ -27,6 +27,7 @@ Options:
 """
 
 import argparse
+import asyncio
 import json
 import os
 import platform
@@ -42,6 +43,8 @@ from pathlib import Path
 from urllib.request import urlretrieve
 
 import anthropic
+
+import viz
 
 # ---------------------------------------------------------------- settings ---
 
@@ -77,6 +80,8 @@ KOKORO_BASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/mod
 KOKORO_FILES = ["kokoro-v1.0.int8.onnx", "voices-v1.0.bin"]   # about 120 MB total
 KOKORO_DEFAULT_VOICE = "am_michael"   # others to try: am_onyx, am_liam, bm_daniel
 
+VIZ = viz.hub                     # fed by Ears, Voice and handle; drawn by --viz terminal|pygame
+
 DEBUG = False
 LOG_FILE = APP_DIR / "debug.log"
 
@@ -103,12 +108,17 @@ def enable_debug():
 _stop = threading.Event()        # set by the stop hotkey; cleared at the start of each turn
 
 
+def _on_stop():
+    _stop.set()
+    VIZ.flash_stop()
+
+
 def start_stop_hotkey():
     """Listen for STOP_HOTKEY from any window (the mic is muted while Leo talks, so
     stopping by voice isn't possible)."""
     try:
         from pynput import keyboard
-        hk = keyboard.GlobalHotKeys({STOP_HOTKEY: _stop.set})
+        hk = keyboard.GlobalHotKeys({STOP_HOTKEY: _on_stop})
         hk.daemon = True
         hk.start()
         key = STOP_HOTKEY.replace("<", "").replace(">", "").replace("+", " + ").title()
@@ -331,8 +341,9 @@ class Voice:
     engine="system": macOS `say` on Mac, pyttsx3 (Windows/Linux system voices) elsewhere.
     """
 
-    def __init__(self, voice_name=None, engine="system"):
+    def __init__(self, voice_name=None, engine="system", stream=False):
         self.kokoro_mode = engine == "kokoro"
+        self.stream_tts = stream and self.kokoro_mode   # speak sentence by sentence while the rest is synthesized
         self.mac = platform.system() == "Darwin"
         self.voice_name = voice_name
         self._cache = {}                      # short phrases (the greeting) are synthesized once
@@ -368,11 +379,19 @@ class Voice:
 
     def say(self, text, cache=False):
         """Speak text. Returns True if the stop hotkey cut it short (or had already been pressed)."""
+        try:
+            return self._say(text, cache)
+        finally:
+            VIZ.voice_end()
+
+    def _say(self, text, cache):
         if not text:
             return False
         if _stop.is_set():
             return True
         if self.kokoro_mode:
+            if self.stream_tts and not cache:
+                return self._say_stream(text)
             import sounddevice as sd
             if cache and text in self._cache:
                 samples, rate = self._cache[text]
@@ -382,6 +401,7 @@ class Voice:
                     self._cache[text] = (samples, rate)
             if _stop.is_set():
                 return True
+            VIZ.voice_start(samples, rate)
             sd.play(samples, rate)
             end = time.time() + len(samples) / rate
             while time.time() < end + 0.1:
@@ -391,6 +411,7 @@ class Voice:
                 time.sleep(0.03)
             sd.wait()
         elif self.mac:
+            VIZ.voice_start()
             cmd = ["say"] + (["-v", self.voice_name] if self.voice_name else []) + [text]
             proc = subprocess.Popen(cmd)
             while proc.poll() is None:
@@ -399,9 +420,78 @@ class Voice:
                     return True
                 time.sleep(0.03)
         else:
+            VIZ.voice_start()
             self.engine.say(text)
             self.engine.runAndWait()      # the started-word callback stops it if _stop is set
         return _stop.is_set()
+
+    def _say_stream(self, text):
+        """Kokoro, streamed: a background thread synthesizes sentence by sentence while the
+        previous sentence plays, so speech starts after the first one instead of after all of them."""
+        import sounddevice as sd
+        chunks = queue.Queue(maxsize=2)
+        cancel = threading.Event()
+
+        def put(item):
+            while not cancel.is_set():
+                try:
+                    chunks.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    pass
+
+        async def synthesize():
+            gen = self.kokoro.create_stream(text, voice=self.voice_name, speed=1.05, lang="en-us")
+            try:
+                async for samples, rate in gen:
+                    put((samples, rate))
+                    if cancel.is_set():
+                        break
+            finally:
+                await gen.aclose()
+
+        def produce():
+            try:
+                asyncio.run(synthesize())
+            except Exception as e:
+                put(e)
+            put(None)
+
+        threading.Thread(target=produce, daemon=True).start()
+        stream, scheduled_end, t_start = None, 0.0, time.time()
+        try:
+            while True:
+                try:
+                    item = chunks.get(timeout=0.05)
+                except queue.Empty:
+                    if _stop.is_set():
+                        return True
+                    continue
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                samples, rate = item
+                if stream is None:
+                    stream = sd.OutputStream(samplerate=rate, channels=1, dtype="float32")
+                    stream.start()
+                    dbg(f"first sentence ready after {time.time() - t_start:.2f}s")
+                starts = max(scheduled_end, time.time() + (stream.latency if not scheduled_end else 0))
+                scheduled_end = starts + len(samples) / rate
+                VIZ.voice_chunk(samples, rate, starts)
+                step = max(1, rate // 20)
+                for i in range(0, len(samples), step):
+                    if _stop.is_set():
+                        stream.abort()
+                        return True
+                    stream.write(samples[i:i + step].reshape(-1, 1))
+            if stream is not None:
+                stream.stop()           # waits for the tail to finish playing
+            return _stop.is_set()
+        finally:
+            cancel.set()
+            if stream is not None:
+                stream.close()
 
     def list_voices(self):
         if self.kokoro_mode:
@@ -434,6 +524,7 @@ class Ears:
         self.whisper = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
 
     def _on_audio(self, data, frames, t, status):
+        VIZ.push_mic(data, SAMPLE_RATE, self.muted)
         if not self.muted:
             self.q.put(bytes(data))
 
@@ -544,6 +635,7 @@ def ensure_vosk_model():
 
 def handle(question, brain, voice, ears, announce):
     print(f"\nYou: {question}")
+    VIZ.begin_turn(question)
     brain.trace = new_trace()
     rec = {"v": 1, "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": RUN_MODE, "question": question,
            "route": None, "tier": None, "answer": None, "stopped": False, "error": None, "seconds": {}}
@@ -564,6 +656,8 @@ def handle(question, brain, voice, ears, announce):
         rec["tier"] = tier
         web = " + web" if route.get("needs_web") and brain.allow_web else ""
         print(f"  -> {tier}{web}  ({route.get('reason', '')})")
+        VIZ.set_route(tier, bool(web))
+        VIZ.set_stage("answering")
 
         if announce and ANNOUNCEMENTS[tier]:
             speak(ANNOUNCEMENTS[tier], voice, ears)
@@ -586,6 +680,7 @@ def handle(question, brain, voice, ears, announce):
         reply = spoken_error(e)
     print(f"Claude ({time.time() - started:.1f}s): {reply}")
     t = time.time()
+    VIZ.set_answer(speakable(reply))
     rec["stopped"] = speak(speakable(reply), voice, ears)
     if rec["stopped"]:
         print("  (stopped)")
@@ -615,6 +710,9 @@ def main():
     p.add_argument("--voice", help="text-to-speech voice name (kokoro: e.g. af_heart, am_michael)")
     p.add_argument("--tts", choices=["system", "kokoro"], default="system",
                    help="speech engine: system voices, or kokoro (natural, local)")
+    p.add_argument("--stream-tts", action="store_true",
+                   help="with --tts kokoro: start speaking after the first sentence instead of waiting "
+                        "for the whole answer to be synthesized")
     p.add_argument("--name", default=os.environ.get("HEY_CLAUDE_NAME"),
                    help='your name; after the wake word it says "Yes, <name>" (or set HEY_CLAUDE_NAME)')
     p.add_argument("--list-voices", action="store_true")
@@ -622,9 +720,16 @@ def main():
                    help=f"don't save questions and answers to {CONV_DIR}")
     p.add_argument("--debug", action="store_true",
                    help=f"show timings, token use, wake-word and web-search details; also logs to {LOG_FILE}")
+    p.add_argument("--viz", choices=["none", "terminal", "pygame"], default="none",
+                   help="live visuals: waveforms of you and Leo, spectrum, pipeline stage "
+                        "(terminal: in this console; pygame: its own window)")
     p.add_argument("--test-voice", action="store_true",
                    help="just speak a sample and exit (no API key or microphone needed)")
     args = p.parse_args()
+    if args.stream_tts and args.tts != "kokoro":
+        p.error("--stream-tts needs --tts kokoro")
+    if args.viz == "terminal" and args.text:
+        p.error("--viz terminal takes over the screen, so it can't be combined with --text; use --viz pygame")
 
     LOG_CONVERSATIONS = not args.no_log
     RUN_MODE = "text" if args.text else "ptt" if args.ptt else "wake"
@@ -633,7 +738,15 @@ def main():
         dbg(f"python {platform.python_version()} on {platform.system()}; "
             f"mode={'text' if args.text else 'ptt' if args.ptt else 'wake word'}, tts={args.tts}, "
             f"voice={args.voice}, web={'off' if args.no_web else 'on'}, whisper={WHISPER_SIZE}")
-    voice = Voice(args.voice, args.tts)
+    if args.viz == "none" or args.list_voices or args.test_voice:
+        session(args)
+    else:
+        # The assistant runs in a worker thread so the visuals can own the main thread.
+        viz.run(args.viz, lambda: session(args))
+
+
+def session(args):
+    voice = Voice(args.voice, args.tts, stream=args.stream_tts)
     if args.list_voices:
         voice.list_voices()
         return
@@ -656,6 +769,7 @@ def main():
             if q:
                 _stop.clear()
                 handle(q, brain, voice, None, args.announce)
+                VIZ.set_stage("idle")
 
     greeting = f"Yes, {args.name}." if args.name else "Yes?"
     if voice.kokoro_mode:
@@ -667,6 +781,7 @@ def main():
     print("Ctrl+C to quit.")
 
     while True:
+        VIZ.set_stage("idle")
         if args.ptt:
             input()
             _stop.clear()
@@ -679,7 +794,9 @@ def main():
                 continue
         ears.beep(880)
         print("Listening...")
+        VIZ.set_stage("listening")
         audio = ears.record_question()
+        VIZ.set_stage("transcribing")
         ears.beep(660, 80)
         if _stop.is_set():
             print("  (stopped)")
