@@ -449,6 +449,18 @@ POSE_FOR_STAGE = {"listening": "listening", "transcribing": "thinking", "routing
                   "answering": "thinking", "speaking": "speaking"}     # anything else: portrait
 POSE_FADE = 0.35                    # seconds to crossfade between poses
 ORB_Y = 0.4                         # height of Leo's orb, as a fraction of the window; captions sit below it
+TRAY_LINGER = 5.0                   # --tray: default seconds the window stays up after the conversation ends
+APPEAR = 0.45                       # --tray: seconds to fade in (and pop Leo up) when he's called
+VANISH = 0.35                       # --tray: seconds to fade out when he's done
+
+
+def _ease_out(x):
+    return 1 - (1 - x) ** 3
+
+
+def _ease_out_back(x, k=1.7):
+    """0 to 1 with a small overshoot past 1 before settling."""
+    return 1 + (k + 1) * (x - 1) ** 3 + k * (x - 1) ** 2
 
 
 def _windows_app_id():
@@ -484,16 +496,62 @@ def _windows_title_bar(hwnd, bg, fg):
         pass
 
 
+def _windows_on_top(hwnd):
+    """Keep the borderless --tray window above everything, taskbar included, and try to focus it."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND] + [ctypes.c_int] * 4 + [ctypes.c_uint]
+        user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)  # TOPMOST, NOSIZE|NOMOVE|SHOW
+        user32.SetForegroundWindow(wintypes.HWND(hwnd))
+    except Exception:
+        pass
+
+
+def _tray_image():
+    """Leo's portrait circle for the tray icon, or a plain orange dot without it."""
+    from PIL import Image, ImageDraw
+    size = 64
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    try:
+        file, (x, y, r) = AVATARS["portrait"]
+        img = Image.open(os.path.join(ASSETS, file)).convert("RGBA").crop((x - r, y - r, x + r, y + r))
+        img = img.resize((size, size), Image.LANCZOS)
+    except OSError:
+        img = Image.new("RGBA", (size, size), LEO_COLOR + (255,))
+    img.putalpha(mask)
+    return img
+
+
 class PygameView:
     BG = (11, 13, 20)
 
-    def __init__(self, hub):
+    def __init__(self, hub, tray_monitor=None, tray_linger=TRAY_LINGER):
         try:
             import pygame
         except ImportError:
             sys.exit("--viz pygame needs pygame: pip install pygame")
         self.pg = pygame
         self.hub = hub
+        # --tray: no window until Leo is woken, then borderless fullscreen on this display (0-based)
+        self.tray = tray_monitor is not None
+        self.monitor = tray_monitor or 0
+        self.linger = tray_linger      # --hide-after
+        self.visible = False
+        self.pinned = False             # "Show Leo" in the tray menu: stay up even when idle
+        self.dismissed = False          # Esc during a conversation: stay hidden until it ends
+        self.last_busy = 0.0
+        self.reopen = False             # monitor changed from the tray menu while showing
+        self.quit = False
+        self.icon = None
+        self.window = None              # SDL window handle, for its opacity
+        self.fade = 1.0                 # 0..1 how far the --tray window has faded in (always 1 otherwise)
+        self.t_step = time.time()
+        self.u = 1.0                    # UI scale: fonts and pipeline pills grow on big fullscreen windows
         self.lm = self.lv = 0.0
         self.spec = np.zeros(32, np.float32)
         self.col = np.array(STATE_COLOR["idle"], np.float64)
@@ -516,16 +574,117 @@ class PygameView:
 
         # window: Leo as the icon, and on Windows his own taskbar entry and a title bar in the viz colors
         _windows_app_id()
+        self.fonts(1.0)
+        if self.tray:
+            self.sizes = pg.display.get_desktop_sizes()
+            self.monitor = min(self.monitor, len(self.sizes) - 1)
+            pg.display.quit()           # no window until he's called
+            self.start_tray()
+            return
         if "portrait" in self.poses:
             pg.display.set_icon(self.circle("portrait", 32))
         pg.display.set_caption("Hey Leo")
         pg.display.set_mode((1000, 660), pg.RESIZABLE)
         _windows_title_bar(pg.display.get_wm_info().get("window"), self.BG, (225, 228, 240))
 
+    def fonts(self, u):
+        pg = self.pg
         names = "segoeui,helveticaneue,arial,dejavusans"
-        self.f_big = pg.font.SysFont(names, 26, bold=True)
-        self.f_mid = pg.font.SysFont(names, 20)
-        self.f_small = pg.font.SysFont(names, 15, bold=True)
+        self.u = u
+        self.f_big = pg.font.SysFont(names, int(26 * u), bold=True)
+        self.f_mid = pg.font.SysFont(names, int(20 * u))
+        self.f_small = pg.font.SysFont(names, int(15 * u), bold=True)
+
+    # -- --tray: an icon in the system tray, and a fullscreen window only while Leo is in a conversation --
+    def start_tray(self):
+        try:
+            import pystray
+        except ImportError:
+            sys.exit("--tray needs pystray and Pillow: pip install pystray pillow")
+        item, Menu = pystray.MenuItem, pystray.Menu
+
+        def pick(n):
+            def choose(icon, it):
+                self.monitor, self.reopen = n, True
+            return choose
+
+        def toggle(icon, it):
+            self.pinned = not self.pinned
+            self.dismissed = False
+
+        def quit_(icon, it):
+            self.quit = True
+
+        screens = [item(f"{n + 1}: {w}\u00d7{h}", pick(n), checked=lambda it, n=n: self.monitor == n, radio=True)
+                   for n, (w, h) in enumerate(self.sizes)]
+        menu = Menu(item("Show Leo", toggle, checked=lambda it: self.pinned, default=True),
+                    item("Monitor", Menu(*screens)),
+                    Menu.SEPARATOR,
+                    item("Quit", quit_))
+        self.icon = pystray.Icon("HeyLeo", _tray_image(), "Hey Leo", menu)
+        threading.Thread(target=self.icon.run, daemon=True).start()
+        print("Monitors: " + ", ".join(f"{n + 1}: {w}x{h}" for n, (w, h) in enumerate(self.sizes))
+              + f". Leo shows up on {self.monitor + 1} (change it from the tray icon).")
+
+    def show(self):
+        pg = self.pg
+        pg.display.init()
+        sizes = pg.display.get_desktop_sizes()
+        n = min(self.monitor, len(sizes) - 1)
+        if "portrait" in self.poses:
+            pg.display.set_icon(self.circle("portrait", 32))
+        pg.display.set_caption("Hey Leo")
+        # created hidden and fully transparent, so it fades in instead of flashing up black
+        pg.display.set_mode(sizes[n], pg.NOFRAME | pg.HIDDEN, display=n)
+        self.window = None
+        try:
+            from pygame._sdl2.video import Window
+            self.window = Window.from_display_module()
+            self.window.opacity = 0.0
+            self.window.show()
+        except Exception:               # no opacity control: just appear (the pop-in still plays)
+            pg.display.set_mode(sizes[n], pg.NOFRAME, display=n)
+        _windows_on_top(pg.display.get_wm_info().get("window"))
+        self.pose_imgs.clear()
+        self.fonts(max(1.0, sizes[n][1] / 760))
+        self.fade = 0.0
+        self.hold = 2                   # frames drawn at opacity 0 first: the window and Leo's images get built
+        self.visible = True
+
+    def hide(self):
+        self.pg.display.quit()
+        self.window = None
+        self.visible = False
+
+    def tray_step(self):
+        """Show, hide or fade the window for what Leo is doing. Returns True when it is up."""
+        f = self.hub.frame()
+        now = time.time()
+        dt, self.t_step = min(0.1, now - self.t_step), now
+        busy = active_stage(f) != "idle" or f.stop_age < 0.7
+        if not busy:
+            self.dismissed = False
+        elif not self.dismissed:
+            self.last_busy = now
+        want = (self.pinned or now - self.last_busy < self.linger) and not self.dismissed
+        if self.visible and self.reopen:
+            self.hide()                 # moving to another monitor: no fade, it reappears there at once
+        self.reopen = False
+        if want and not self.visible:
+            self.show()
+        if self.visible and self.hold:
+            self.hold -= 1
+        elif self.visible:
+            self.fade = min(1.0, self.fade + dt / APPEAR) if want else max(0.0, self.fade - dt / VANISH)
+            if self.fade == 0.0 and not want:
+                self.hide()
+            elif self.window:
+                self.window.opacity = _ease_out(self.fade)
+        return self.visible
+
+    def dismiss(self):
+        """Esc, Q or closing the window in --tray mode: fade out until Leo is called again."""
+        self.pinned, self.dismissed, self.last_busy = False, True, 0.0
 
     def circle(self, name, radius):
         """Pose `name` cut to a circle of `radius`, as a new surface with transparent corners."""
@@ -566,15 +725,25 @@ class PygameView:
         s.blit(img, (cx - radius, cy - radius))
 
     def close(self):
+        if self.icon:
+            self.icon.stop()
         self.pg.quit()
 
     def loop(self, done):
         pg = self.pg
         clock = pg.time.Clock()
-        while not done():
+        while not done() and not self.quit:
+            if self.tray and not self.tray_step():
+                time.sleep(0.05)
+                continue
             for e in pg.event.get():
                 if e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key in (pg.K_ESCAPE, pg.K_q)):
-                    return
+                    if not self.tray:
+                        return
+                    self.dismiss()
+                    break
+            if not pg.display.get_init():
+                continue
             self.draw(pg.display.get_surface(), self.hub.frame())
             pg.display.flip()
             clock.tick(60)
@@ -602,7 +771,7 @@ class PygameView:
         b = badge(f)
         if b:
             img = self.f_small.render(b, True, LEO_COLOR)
-            s.blit(img, (W - img.get_width() - 20, 22))
+            s.blit(img, (W - img.get_width() - int(20 * self.u), int(22 * self.u)))
         if f.stop_age < 0.7:
             veil = pg.Surface((W, H), pg.SRCALPHA)
             veil.fill((255, 60, 60, int(110 * (1 - f.stop_age / 0.7))))
@@ -612,25 +781,28 @@ class PygameView:
 
     def draw_pipeline(self, s, W, state, col):
         pg = self.pg
-        pads, gap = 14, 8
+        u = self.u
+        pads, gap, h = int(14 * u), int(8 * u), int(28 * u)
+        top = int(16 * u - (1 - _ease_out(self.fade)) * 50 * u)     # slides down from above as the window fades in
         imgs = [(key, self.f_small.render(label, True, (255, 255, 255))) for key, label in PIPELINE]
         total = sum(i.get_width() + 2 * pads for _, i in imgs) + gap * (len(imgs) - 1)
         x = (W - total) // 2
         for key, img in imgs:
             w = img.get_width() + 2 * pads
-            r = pg.Rect(x, 16, w, 28)
+            r = pg.Rect(x, top, w, h)
+            ty = r.centery - img.get_height() // 2
             if key == state:
-                pg.draw.rect(s, tuple(int(c) for c in col), r, border_radius=14)
-                s.blit(self.f_small.render(LABELS[key], True, (12, 14, 22)), (x + pads, 21))
+                pg.draw.rect(s, tuple(int(c) for c in col), r, border_radius=h // 2)
+                s.blit(self.f_small.render(LABELS[key], True, (12, 14, 22)), (x + pads, ty))
             else:
-                pg.draw.rect(s, (45, 50, 66), r, width=1, border_radius=14)
-                s.blit(self.f_small.render(LABELS[key], True, (95, 102, 125)), (x + pads, 21))
+                pg.draw.rect(s, (45, 50, 66), r, width=1, border_radius=h // 2)
+                s.blit(self.f_small.render(LABELS[key], True, (95, 102, 125)), (x + pads, ty))
             x += w + gap
 
     def draw_orb(self, s, W, H, t, state, active, col):
         pg = self.pg
         cx, cy = W // 2, int(H * ORB_Y)
-        r0 = min(W * 0.12, H * 0.1)
+        r0 = min(W * 0.12, H * 0.1) * (0.55 + 0.45 * _ease_out_back(self.fade))   # pops up as the window fades in
         breath = 0.05 * math.sin(t * 1.6) if state == "idle" else 0.0
         R = r0 * (1 + breath + 0.45 * active)
         ra = int(r0 * 1.35) if self.poses else 0   # Leo's portrait radius (fixed)
@@ -677,11 +849,11 @@ class PygameView:
 
     def draw_captions(self, s, W, H, f):
         x, width = int(W * 0.12), int(W * 0.76)
-        y = int(H * 0.7)
+        y = int(H * 0.7 + (1 - _ease_out(self.fade)) * 40 * self.u)     # rises into place as the window fades in
         for tag, text, color, n in (("YOU", f.question, YOU_COLOR, 1), ("LEO", f.answer, LEO_COLOR, 3)):
             if not text:
                 continue
-            s.blit(self.f_small.render(tag, True, color), (x - 46, y + 4))
+            s.blit(self.f_small.render(tag, True, color), (x - int(46 * self.u), y + int(4 * self.u)))
             for line in _wrap(self.f_mid, text, width, n):
                 s.blit(self.f_mid.render(line, True, (225, 228, 240)), (x, y))
                 y += self.f_mid.get_linesize()
@@ -690,9 +862,11 @@ class PygameView:
 
 # --------------------------------------------------------------------- run ---
 
-def run(mode, target):
-    """Run `target()` (the assistant) in a worker thread, with a renderer on the main thread."""
-    view = TerminalView(hub) if mode == "terminal" else PygameView(hub)
+def run(mode, target, tray_monitor=None, tray_linger=TRAY_LINGER):
+    """Run `target()` (the assistant) in a worker thread, with a renderer on the main thread.
+    `tray_monitor` (pygame only): live in the system tray and go fullscreen on that display when called,
+    hiding again `tray_linger` seconds after the conversation ends."""
+    view = TerminalView(hub) if mode == "terminal" else PygameView(hub, tray_monitor, tray_linger)
     errors = []
 
     def work():

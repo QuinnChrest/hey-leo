@@ -811,11 +811,32 @@ def main():
     p.add_argument("--viz", choices=["none", "terminal", "pygame"], default="none",
                    help="live visuals: waveforms of you and Leo, spectrum, pipeline stage "
                         "(terminal: in this console; pygame: its own window)")
+    p.add_argument("--tray", action="store_true",
+                   help="live in the system tray; when you say the wake word Leo goes fullscreen "
+                        "(pygame visuals) and hides again when the conversation is over")
+    p.add_argument("--monitor", type=int, default=1,
+                   help="with --tray: which monitor Leo appears on, 1 = first (also changeable from the tray menu)")
+    p.add_argument("--hide-after", type=float, default=viz.TRAY_LINGER, metavar="SECONDS",
+                   help=f"with --tray: how long Leo stays on screen after the conversation ends "
+                        f"(default {viz.TRAY_LINGER:g})")
     p.add_argument("--test-voice", action="store_true",
                    help="just speak a sample and exit (no API key or microphone needed)")
     args = p.parse_args()
     if args.stream_tts and args.tts != "kokoro":
         p.error("--stream-tts needs --tts kokoro")
+    if args.tray:
+        if args.viz == "terminal":
+            p.error("--tray uses the pygame window, so it can't be combined with --viz terminal")
+        if args.monitor < 1:
+            p.error("--monitor counts from 1")
+        if args.hide_after < 0:
+            p.error("--hide-after can't be negative")
+        args.viz = "pygame"
+        if sys.stdout is None:          # pythonw: no console, so keep the output in a file
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            sys.stdout = sys.stderr = open(APP_DIR / "tray.log", "a", encoding="utf-8", buffering=1)
+    elif args.monitor != 1 or args.hide_after != viz.TRAY_LINGER:
+        p.error("--monitor and --hide-after need --tray")
     if args.viz == "terminal" and args.text:
         p.error("--viz terminal takes over the screen, so it can't be combined with --text; use --viz pygame")
 
@@ -830,7 +851,8 @@ def main():
         session(args)
     else:
         # The assistant runs in a worker thread so the visuals can own the main thread.
-        viz.run(args.viz, lambda: session(args))
+        viz.run(args.viz, lambda: session(args), tray_monitor=args.monitor - 1 if args.tray else None,
+                tray_linger=args.hide_after)
 
 
 def session(args):
