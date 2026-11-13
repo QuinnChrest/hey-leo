@@ -372,6 +372,19 @@ def _wrap(font, text, width, max_lines):
     return lines
 
 
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+# Leo's poses: image file and the circle (center x, center y, radius, in that image's pixels) cut out of it
+AVATARS = {
+    "portrait":  ("leo-portrait.webp", (649, 526, 389)),
+    "listening": ("leo-poses.webp", (320, 315, 215)),
+    "thinking":  ("leo-poses.webp", (895, 330, 225)),
+    "speaking":  ("leo-poses.webp", (1495, 315, 215)),
+}
+POSE_FOR_STAGE = {"listening": "listening", "transcribing": "thinking", "routing": "thinking",
+                  "answering": "thinking", "speaking": "speaking"}     # anything else: portrait
+POSE_FADE = 0.35                    # seconds to crossfade between poses
+
+
 class PygameView:
     BG = (11, 13, 20)
 
@@ -397,6 +410,46 @@ class PygameView:
         self.f_big = pg.font.SysFont(names, 26, bold=True)
         self.f_mid = pg.font.SysFont(names, 20)
         self.f_small = pg.font.SysFont(names, 15, bold=True)
+        self.poses, self.pose_imgs = {}, {}
+        files = {}
+        for name, (file, circle) in AVATARS.items():
+            try:
+                if file not in files:
+                    files[file] = pg.image.load(os.path.join(ASSETS, file)).convert()
+                self.poses[name] = (files[file], circle)
+            except (OSError, pg.error):
+                pass                    # missing pose: falls back to the portrait, or the plain orb
+        self.pose, self.prev_pose, self.pose_since = "portrait", None, 0.0
+
+    def avatar(self, name, radius):
+        """Pose `name` cut to a circle of `radius`, rebuilt only when the size changes."""
+        pg = self.pg
+        img = self.pose_imgs.get(name)
+        if img is None or img.get_width() != radius * 2:
+            src, (x, y, r) = self.poses[name]
+            iw, ih = src.get_size()
+            r = min(r, x, y, iw - x, ih - y)
+            img = pg.transform.smoothscale(src.subsurface(pg.Rect(x - r, y - r, 2 * r, 2 * r)), (radius * 2, radius * 2)).convert_alpha()
+            mask = pg.Surface(img.get_size(), pg.SRCALPHA)
+            pg.draw.circle(mask, (255, 255, 255, 255), (radius, radius), radius)
+            img.blit(mask, (0, 0), special_flags=pg.BLEND_RGBA_MIN)
+            self.pose_imgs[name] = img
+        return img
+
+    def draw_avatar(self, s, cx, cy, radius, state, t):
+        """Leo in the pose for this stage, crossfading from the previous one."""
+        want = POSE_FOR_STAGE.get(state, "portrait")
+        if want not in self.poses:
+            want = "portrait" if "portrait" in self.poses else next(iter(self.poses))
+        if want != self.pose:
+            self.prev_pose, self.pose, self.pose_since = self.pose, want, t
+        fade = min(1.0, (t - self.pose_since) / POSE_FADE)
+        if fade < 1 and self.prev_pose in self.poses:
+            s.blit(self.avatar(self.prev_pose, radius), (cx - radius, cy - radius))
+        img = self.avatar(self.pose, radius)
+        img.set_alpha(int(255 * fade))
+        s.blit(img, (cx - radius, cy - radius))
+        img.set_alpha(None)
 
     def close(self):
         self.pg.quit()
@@ -468,11 +521,14 @@ class PygameView:
         r0 = min(W * 0.12, H * 0.085)
         breath = 0.05 * math.sin(t * 1.6) if state == "idle" else 0.0
         R = r0 * (1 + breath + 0.45 * active)
+        ra = int(r0 * 1.35) if self.poses else 0   # Leo's portrait radius (fixed)
+        if ra:
+            R = max(R, ra * 0.85)       # keep the glow outside the portrait
 
         # frequency ring, mirrored left/right, lows at the top
         nb = len(self.spec)
         rot = t * 0.6 if state in THINKING else 0.0
-        inner = R * 1.3
+        inner = max(R * 1.3, ra + 12)
         for i in range(nb * 2):
             idx = i if i < nb else 2 * nb - 1 - i
             ang = -math.pi / 2 + (i + 0.5) * math.pi / nb + rot
@@ -487,11 +543,18 @@ class PygameView:
         glow = pg.Surface((gs * 2, gs * 2), pg.SRCALPHA)
         for k in range(8, 0, -1):
             pg.draw.circle(glow, (*[int(c) for c in col], 6 + (9 - k) * 3), (gs, gs), int(R * (1 + 0.2 * k)))
-        for i in range(12):
-            frac = i / 11
-            c = lerp_color(tuple(c * 0.55 for c in col), lerp_color(col, (255, 255, 255), 0.55), frac)
-            pg.draw.circle(glow, (*[int(v) for v in c], 255), (gs, gs), max(1, int(R * (1 - frac * 0.85))))
+        if not ra:
+            for i in range(12):
+                frac = i / 11
+                c = lerp_color(tuple(c * 0.55 for c in col), lerp_color(col, (255, 255, 255), 0.55), frac)
+                pg.draw.circle(glow, (*[int(v) for v in c], 255), (gs, gs), max(1, int(R * (1 - frac * 0.85))))
         s.blit(glow, (cx - gs, cy - gs))
+
+        # Leo's portrait, framed by a ring in the stage color that brightens with the sound
+        if ra:
+            self.draw_avatar(s, cx, cy, ra, state, t)
+            ring = lerp_color(col, (255, 255, 255), min(0.6, active))
+            pg.draw.circle(s, tuple(int(v) for v in ring), (cx, cy), ra + 2, 3 + int(5 * active))
 
         # thinking: particles orbiting the orb
         if state in THINKING:
