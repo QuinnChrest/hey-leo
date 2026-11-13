@@ -440,7 +440,7 @@ def _wrap(font, text, width, max_lines):
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 # Leo's poses: image file and the circle (center x, center y, radius, in that image's pixels) cut out of it
 AVATARS = {
-    "portrait":  ("leo-portrait.webp", (649, 526, 389)),
+    "portrait":  ("leo-portrait.webp", (681, 480, 360)),
     "listening": ("leo-poses.webp", (320, 315, 215)),
     "thinking":  ("leo-poses.webp", (895, 330, 225)),
     "speaking":  ("leo-poses.webp", (1495, 315, 215)),
@@ -448,6 +448,7 @@ AVATARS = {
 POSE_FOR_STAGE = {"listening": "listening", "transcribing": "thinking", "routing": "thinking",
                   "answering": "thinking", "speaking": "speaking"}     # anything else: portrait
 POSE_FADE = 0.35                    # seconds to crossfade between poses
+ORB_Y = 0.4                         # height of Leo's orb, as a fraction of the window; captions sit below it
 
 
 class PygameView:
@@ -509,12 +510,15 @@ class PygameView:
         if want != self.pose:
             self.prev_pose, self.pose, self.pose_since = self.pose, want, t
         fade = min(1.0, (t - self.pose_since) / POSE_FADE)
+        # set_alpha(None) would switch off blending and blit the cut-away corners as a square,
+        # so every blit sets an explicit alpha instead
         if fade < 1 and self.prev_pose in self.poses:
-            s.blit(self.avatar(self.prev_pose, radius), (cx - radius, cy - radius))
+            prev = self.avatar(self.prev_pose, radius)
+            prev.set_alpha(255)
+            s.blit(prev, (cx - radius, cy - radius))
         img = self.avatar(self.pose, radius)
         img.set_alpha(int(255 * fade))
         s.blit(img, (cx - radius, cy - radius))
-        img.set_alpha(None)
 
     def close(self):
         self.pg.quit()
@@ -549,8 +553,6 @@ class PygameView:
         self.draw_pipeline(s, W, state, col)
         self.draw_orb(s, W, H, t, state, active, col)
         self.draw_captions(s, W, H, f)
-        self.draw_lane(s, "YOU", f.mic, YOU_COLOR, int(H * 0.80), int(H * 0.055), W, 4.0, not f.speaking)
-        self.draw_lane(s, "LEO", f.voice, LEO_COLOR, int(H * 0.92), int(H * 0.055), W, 1.6, f.speaking)
 
         b = badge(f)
         if b:
@@ -561,7 +563,7 @@ class PygameView:
             veil.fill((255, 60, 60, int(110 * (1 - f.stop_age / 0.7))))
             s.blit(veil, (0, 0))
             img = self.f_big.render("STOPPED", True, (255, 255, 255))
-            s.blit(img, img.get_rect(center=(W // 2, int(H * 0.32))))
+            s.blit(img, img.get_rect(center=(W // 2, int(H * ORB_Y))))
 
     def draw_pipeline(self, s, W, state, col):
         pg = self.pg
@@ -582,8 +584,8 @@ class PygameView:
 
     def draw_orb(self, s, W, H, t, state, active, col):
         pg = self.pg
-        cx, cy = W // 2, int(H * 0.32)
-        r0 = min(W * 0.12, H * 0.085)
+        cx, cy = W // 2, int(H * ORB_Y)
+        r0 = min(W * 0.12, H * 0.1)
         breath = 0.05 * math.sin(t * 1.6) if state == "idle" else 0.0
         R = r0 * (1 + breath + 0.45 * active)
         ra = int(r0 * 1.35) if self.poses else 0   # Leo's portrait radius (fixed)
@@ -630,7 +632,7 @@ class PygameView:
 
     def draw_captions(self, s, W, H, f):
         x, width = int(W * 0.12), int(W * 0.76)
-        y = int(H * 0.585)
+        y = int(H * 0.7)
         for tag, text, color, n in (("YOU", f.question, YOU_COLOR, 1), ("LEO", f.answer, LEO_COLOR, 3)):
             if not text:
                 continue
@@ -639,21 +641,6 @@ class PygameView:
                 s.blit(self.f_mid.render(line, True, (225, 228, 240)), (x, y))
                 y += self.f_mid.get_linesize()
             y += 4
-
-    def draw_lane(self, s, label, wave, color, cy, h, W, gain, live):
-        pg = self.pg
-        x0, x1 = 80, W - 30
-        n = x1 - x0
-        if n < 20:
-            return
-        ys = wave[::max(1, len(wave) // n)][:n]
-        xs = np.linspace(x0, x1, len(ys))
-        pts = [(float(x), float(y)) for x, y in zip(xs, cy - np.clip(ys * gain, -1, 1) * h)]
-        s.blit(self.f_small.render(label, True, color if live else tuple(c * 0.5 for c in color)), (24, cy - 9))
-        pg.draw.line(s, (35, 40, 55), (x0, cy), (x1, cy), 1)
-        if len(pts) > 1:
-            pg.draw.lines(s, tuple(int(c * 0.28) for c in color), False, pts, 6)
-            pg.draw.lines(s, color, False, pts, 2)
 
 
 # --------------------------------------------------------------------- run ---
