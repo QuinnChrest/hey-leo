@@ -85,6 +85,8 @@ Claude (2.1s): Cats purr by rapidly twitching the muscles in their voice box...
 
 Follow-up questions work: "How about dogs?" remembers what you just asked, for up to 5 minutes.
 
+When Leo ends an answer with a question ("Want the steps?"), you'll hear the beep and can answer right away, without saying "Hey Leo". If you stay quiet for 5 seconds (`FOLLOWUP_WAIT_SECONDS`), it goes back to waiting for the wake word.
+
 ## Conversation log
 
 Every question and answer is saved on your computer, one file per month, in `~/.hey-claude/conversations/` (for example `2026-11.jsonl`). Each line is one question as JSON: what you asked, which model Haiku picked and why, the answer and its word count, the web searches used, input and output tokens for every call, how long each step took, and whether the answer was stopped by you or cut off by the length limit (`"truncated": true`). Nothing is uploaded. Use `--no-log` to turn it off, and delete the files any time.

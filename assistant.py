@@ -71,6 +71,12 @@ MAX_QUESTION_SECONDS = 20
 WAIT_FOR_SPEECH_SECONDS = 6
 MEMORY_MINUTES = 5                # follow-up questions remember context this long
 MEMORY_TURNS = 6
+# Answers think before they speak, and thinking counts toward max_tokens, so leave plenty of
+# room: a low cap gives an empty answer. ANSWER_SYSTEM is what keeps the spoken part short.
+ANSWER_MAX_TOKENS = 4096
+# How hard each tier thinks (low | medium | high | xhigh | max). Lower is faster to answer.
+EFFORT = {"haiku": "low", "sonnet": "low", "opus": "medium"}
+FOLLOWUP_WAIT_SECONDS = 5         # after Leo asks you something, how long the mic waits for a reply
 
 APP_DIR = Path.home() / ".hey-claude"
 VOSK_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
@@ -164,16 +170,51 @@ def usage_str(resp):
     return f"{getattr(u, 'input_tokens', '?')} in / {getattr(u, 'output_tokens', '?')} out tokens"
 
 
-ANSWER_SYSTEM = """You are Leo, a voice assistant. Your answer will be read aloud by a \
-text-to-speech engine, so:
-- Speak naturally, like a knowledgeable friend. Lead with the answer.
-- Keep it short: usually one to three sentences. Go longer only if the question \
-truly needs it, and even then stay under about 150 words.
-- No markdown, bullet points, headings, tables, emoji, URLs or code blocks. \
-Write numbers and units the way a person would say them.
-- If you search the web, don't read out sources or links; just give the answer.
-- If the question is ambiguous, give the most likely answer rather than asking back, \
-unless you really can't.
+ANSWER_SYSTEM = """You are Leo, a voice assistant. Everything you write is read aloud, \
+and a listener can't skim or skip ahead, so every extra sentence costs them time.
+
+How much to say:
+- Default to one or two sentences, about ten seconds of speech. Lead with the answer.
+- Answer exactly what was asked. Leave out background, caveats, alternatives and tips \
+nobody asked for.
+- For broad questions (advice, how-to, recommendations, "tell me about"), give only the \
+one or two things that matter most, then offer more in a few words, like "Want the steps?" \
+You remember the conversation, so they can simply ask for the rest.
+- Go longer, up to about sixty words, only when they ask for detail or a short answer \
+would be wrong.
+- No warm-up or wrap-up: don't praise the question, restate it, sum up, or say \
+"let me know if".
+
+Keeping it a conversation:
+- Talk like a friend in the room, not a reference book.
+- When you end with a question, the mic opens right away so they can answer without \
+the wake word. Most answers should just end, with no question. Ask back only when you \
+need something from them to answer well, or when you held back a part they'd clearly \
+want, like the steps of a recipe. Never tack "want to know more?" onto an answer that \
+is already complete, and ask at most one question.
+- If the question is ambiguous but one reading is clearly most likely, answer that. \
+Ask back only when the answer really depends on something you don't know.
+- If they decline or say thanks, reply in a few words and don't ask anything.
+
+Format: plain spoken sentences. No markdown, lists, headings, emoji, URLs or code. \
+Write numbers and units the way a person says them. If you search the web, don't \
+mention sources; just give the answer.
+
+Examples of the right length:
+Q: What's the capital of Australia?
+A: Canberra.
+Q: Why is the sky blue?
+A: Air scatters blue light much more than red, so blue reaches your eyes from every \
+part of the sky.
+Q: How do I brew the perfect cup of coffee?
+A: Grind fresh beans right before brewing, use about one gram of coffee for every \
+sixteen of water, and pour water just off the boil. Want tips for your brewer?
+Q: How can my buddy get a girlfriend?
+A: Get him somewhere he'll see the same people every week, like a rec league or a \
+class, since that's how most couples meet. Is he shy, or just not getting out much?
+Q: No, that's all, thanks.
+A: Anytime.
+
 The current date and time is {now}."""
 
 ROUTER_SYSTEM = """You route spoken questions to the right AI model. Pick the \
@@ -188,8 +229,12 @@ opus: genuinely hard problems: tricky math or logic puzzles, multi-constraint \
 planning, deep analysis, debugging, questions where subtle reasoning or expertise \
 really matters and a mistake would be costly.
 
-Also decide if answering needs current information from the web (anything about \
-today, recent events, prices, scores, weather, hours, or things that change)."""
+Also decide if answering needs the web. Say yes for current information (anything \
+about today, recent events, prices, scores, weather, hours, or things that change), \
+and for specific details about a particular video game, TV show, movie, book, app or \
+product (bosses, unlocks, builds, plot points, episode details, settings, specs), \
+which models often misremember. Say no for general knowledge that is well known and \
+stable."""
 
 ROUTER_TOOL = {
     "name": "route",
@@ -263,14 +308,18 @@ class Brain:
         system = ANSWER_SYSTEM.format(now=time.strftime("%A, %B %d, %Y, %I:%M %p"))
         use_web = self.allow_web and needs_web
 
-        text = self._ask(MODELS[tier], system, messages, use_web)
+        text = self._ask(MODELS[tier], system, messages, use_web, EFFORT[tier])
+        if not text:     # e.g. it spent the whole token cap thinking; don't go silent or save an empty turn
+            dbg(f"empty answer from {tier}")
+            return "Sorry, I lost my train of thought. Could you ask that again?"
 
         self.history = (messages + [{"role": "assistant", "content": text}])[-MEMORY_TURNS * 2:]
         self.last_turn = time.time()
         return text
 
-    def _ask(self, model, system, messages, use_web):
-        kwargs = dict(model=model, max_tokens=1024, system=system)
+    def _ask(self, model, system, messages, use_web, effort):
+        kwargs = dict(model=model, max_tokens=ANSWER_MAX_TOKENS, system=system,
+                      output_config={"effort": effort})
         if use_web:
             kwargs["tools"] = [WEB_SEARCH_TOOL]
         convo = list(messages)
@@ -291,7 +340,7 @@ class Brain:
         except anthropic.BadRequestError as e:
             if use_web and not is_fatal(e):
                 print(f"  (web search unavailable, answering without it: {e.message})")
-                return self._ask(model, system, messages, use_web=False)
+                return self._ask(model, system, messages, False, effort)
             raise
         # When web search is used, the answer arrives in several text blocks; join them.
         return "".join(b.text for b in resp.content if b.type == "text").strip()
@@ -576,8 +625,9 @@ class Ears:
             if heard and heard != "[unk]":
                 dbg(f"ignored (not the wake phrase): {heard!r}")
 
-    def record_question(self):
-        """Record from now until the speaker goes quiet. Returns raw audio bytes or None."""
+    def record_question(self, wait=WAIT_FOR_SPEECH_SECONDS):
+        """Record from now until the speaker goes quiet. Returns raw audio bytes, or None if
+        nobody starts talking within `wait` seconds."""
         self.flush()
         frames, started, quiet, elapsed = [], False, 0.0, 0.0
         step = CHUNK / SAMPLE_RATE
@@ -591,8 +641,8 @@ class Ears:
                 if loud:
                     started = True
                     frames.append(chunk)
-                elif elapsed > WAIT_FOR_SPEECH_SECONDS:
-                    dbg(f"no speech within {WAIT_FOR_SPEECH_SECONDS}s (threshold {self.threshold:.0f})")
+                elif elapsed > wait:
+                    dbg(f"no speech within {wait}s (threshold {self.threshold:.0f})")
                     return None
                 continue
             frames.append(chunk)
@@ -633,17 +683,25 @@ def ensure_vosk_model():
 
 # -------------------------------------------------------------------- main ---
 
-def handle(question, brain, voice, ears, announce):
+def asks_back(reply):
+    """True if Leo's answer ends with a question, so the mic should open for the reply."""
+    return speakable(reply).rstrip(" \"'”’)").endswith("?")
+
+
+def handle(question, brain, voice, ears, announce, followup=False):
+    """Answer one question. Returns True if Leo asked something back and finished saying it,
+    so the caller should listen for a reply without the wake word."""
     print(f"\nYou: {question}")
     VIZ.begin_turn(question)
     brain.trace = new_trace()
     rec = {"v": 1, "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": RUN_MODE, "question": question,
-           "route": None, "tier": None, "answer": None, "stopped": False, "error": None, "seconds": {}}
+           "followup": followup, "route": None, "tier": None, "answer": None, "stopped": False,
+           "error": None, "seconds": {}}
     if _stop.is_set():
         print("  (stopped)")
         rec["stopped"] = True
         log_turn(rec, brain)
-        return
+        return False
     started = time.time()
     try:
         t = time.time()
@@ -665,7 +723,7 @@ def handle(question, brain, voice, ears, announce):
             print("  (stopped)")
             rec["stopped"] = True
             log_turn(rec, brain)
-            return
+            return False
 
         started = time.time()
         reply = brain.answer(question, tier, route.get("needs_web", False))
@@ -687,6 +745,7 @@ def handle(question, brain, voice, ears, announce):
     rec["seconds"]["speak"] = round(time.time() - t, 2)
     dbg(f"spoken in {rec['seconds']['speak']:.1f}s")
     log_turn(rec, brain)
+    return rec["error"] is None and not rec["stopped"] and asks_back(reply)
 
 
 def speak(text, voice, ears, cache=False):
@@ -780,22 +839,35 @@ def session(args):
     print("\nReady." + (" Press Enter, then ask." if args.ptt else ' Say "Hey Leo".'))
     print("Ctrl+C to quit.")
 
+    followup = False     # Leo just asked something: listen for the reply, no wake word needed
     while True:
-        VIZ.set_stage("idle")
-        if args.ptt:
-            input()
+        if followup:
             _stop.clear()
-        else:
-            ears.wait_for_wake_word()
-            _stop.clear()
-            time.sleep(GREETING_PAUSE)
-            if speak(greeting, voice, ears, cache=True):
-                print("  (stopped)")
+            ears.beep(880)
+            print("Listening for your reply...")
+            VIZ.set_stage("listening")
+            audio = ears.record_question(wait=FOLLOWUP_WAIT_SECONDS)
+            if not audio:          # no reply: quietly go back to waiting for the wake word
+                dbg("no reply to the follow-up question")
+                followup = False
                 continue
-        ears.beep(880)
-        print("Listening...")
-        VIZ.set_stage("listening")
-        audio = ears.record_question()
+        else:
+            VIZ.set_stage("idle")
+            if args.ptt:
+                input()
+                _stop.clear()
+            else:
+                ears.wait_for_wake_word()
+                _stop.clear()
+                time.sleep(GREETING_PAUSE)
+                if speak(greeting, voice, ears, cache=True):
+                    print("  (stopped)")
+                    continue
+            ears.beep(880)
+            print("Listening...")
+            VIZ.set_stage("listening")
+            audio = ears.record_question()
+        was_followup, followup = followup, False
         VIZ.set_stage("transcribing")
         ears.beep(660, 80)
         if _stop.is_set():
@@ -808,7 +880,7 @@ def session(args):
         if len(question) < 2:
             print("  (couldn't make that out)")
             continue
-        handle(question, brain, voice, ears, args.announce)
+        followup = handle(question, brain, voice, ears, args.announce, followup=was_followup)
 
 
 if __name__ == "__main__":
