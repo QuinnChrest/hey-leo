@@ -255,6 +255,55 @@ def _bars(values, rows):
     return lines
 
 
+# Leo as a 20x20 pixel sprite, drawn two pixels per character cell with half blocks.
+LION_COLORS = {
+    "M": (150, 55, 25), "m": (215, 95, 35), "o": (245, 140, 60), "S": (225, 215, 200),
+    "F": (230, 150, 70), "f": (190, 110, 45), "C": (245, 225, 190), "W": (240, 235, 225),
+    "B": (60, 35, 25), "G": (40, 160, 170), "E": (240, 170, 40), "P": (30, 20, 15),
+    "N": (90, 45, 35), "K": (60, 20, 20), "T": (250, 250, 245),
+    "J": (80, 58, 46), "D": (60, 100, 160), "O": (235, 105, 40),
+}                                   # "." is transparent
+_LION_HALF = (                      # left half of the head-on pose; the right half is its mirror
+    "......Mmmm", "....MmmoMm", "..MmmoommM", ".MmSSmFFFF", "MmSSmFFFFF",
+    "MmmFBBBFFF", "MmmGGGGGGG", "MmmGEPEGFF", "MmmFGGGFFF", "MmmfFFFFNN",
+    "MmmfFCCCCN", "MmmmfCCCCC", "MmmmfCCCKK", ".MmmmfWWWW", ".MmmmmWWWW",
+    "..MmmmmWWW", "..MmmmmmWW", "JJJJMmmmDW", "JJJJJJDDDO", "JJJJJJJDDO",
+)
+LION_POSES = {                      # rows that differ from the head-on portrait
+    "portrait": {},
+    "listening": {5: "MmmFFBBBFFFFFBBBFmmM",            # glancing over to the side
+                  7: "MmmGEEPGFFFFGEEPGmmM"},
+    "thinking": {7: "MmmGBEPGFFFFGBEPGmmM",             # narrowed eyes, paw on chin
+                 12: "MmmmfCCCKKKCCfFFfmmM", 13: ".MmmmfWWWWWfFfFfFfM.",
+                 14: ".MmmmmWWWWWFFFFFFfM.", 15: "..MmmmmWWWWfFFFFfmM.",
+                 16: "..MmmmmmWWWJJFFJJmM.", 17: "JJJJMmmmDWWDJJJJJJJJ"},
+    "speaking": {12: "MmmmfCCKTTTTKCCfmmmM", 13: ".MmmmfWWKKKKWWfmmmM."},
+}
+
+
+def _lion_art(pose):
+    rows = [h + h[::-1] for h in _LION_HALF]
+    for i, row in LION_POSES[pose].items():
+        rows[i] = row
+    lines = []
+    for y in range(0, len(rows), 2):
+        cells = []
+        for top, bot in zip(rows[y], rows[y + 1]):
+            t, b = LION_COLORS.get(top), LION_COLORS.get(bot)
+            if t and b:
+                cells.append("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀" % (*t, *b))
+            elif t or b:
+                cells.append("\x1b[49m\x1b[38;2;%d;%d;%dm%s" % (*(t or b), "▀" if t else "▄"))
+            else:
+                cells.append("\x1b[0m ")
+        lines.append("".join(cells) + "\x1b[0m")
+    return lines
+
+
+LION_ART = {pose: _lion_art(pose) for pose in LION_POSES}
+LION_W = len(_LION_HALF[0]) * 2
+
+
 class TerminalView:
     FPS = 24
 
@@ -304,7 +353,9 @@ class TerminalView:
         self.spec = ease(self.spec, spectrum(wave, rate, 48))
 
         inner = W - 2
-        lane_rows = 4 if H >= 30 else 3 if H >= 24 else 2 if H >= 17 else 1
+        art = LION_ART["portrait"] if W >= 60 and H >= 26 else None    # Leo, with captions beside him
+        h = H - len(art) if art else H
+        lane_rows = 4 if h >= 30 else 3 if h >= 24 else 2 if h >= 17 else 1
         lines = []
 
         # header and pipeline
@@ -321,6 +372,20 @@ class TerminalView:
         lines.append(" " + _fg((90, 95, 110), "›").join(strip))
         lines.append("")
 
+        if art:
+            pose = POSE_FOR_STAGE.get(state, "portrait")
+            if pose == "speaking" and self.lv < 0.2:
+                pose = "portrait"       # mouth closes between syllables
+            caps = [""]
+            for tag, text, tcol, n in (("You  ", f.question, YOU_COLOR, 2), ("Leo  ", f.answer, LEO_COLOR, 6)):
+                for i, c in enumerate(textwrap.wrap(text or "", W - LION_W - 10)[:n]):
+                    caps.append((_fg(tcol, tag) if i == 0 else "     ") + c)
+                if text:
+                    caps.append("")
+            for i, row in enumerate(LION_ART[pose]):
+                lines.append(" " + row + "   " + (caps[i] if i < len(caps) else ""))
+            lines.append("")
+
         # waveform lanes
         for name, hist, col in (("YOU", self.hist_mic, YOU_COLOR), ("LEO", self.hist_voice, LEO_COLOR)):
             vals = list(hist)[-inner:]
@@ -336,7 +401,7 @@ class TerminalView:
 
         # captions, then the console log
         room = H - len(lines) - 1
-        if room >= 3:
+        if room >= 3 and not art:
             lines.append("")
             for tag, text, tcol in (("You  ", f.question, YOU_COLOR), ("Leo  ", f.answer, LEO_COLOR)):
                 if not text:
