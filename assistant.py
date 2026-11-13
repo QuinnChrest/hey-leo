@@ -77,6 +77,12 @@ ANSWER_MAX_TOKENS = 4096
 # How hard each tier thinks (low | medium | high | xhigh | max). Lower is faster to answer.
 EFFORT = {"haiku": "low", "sonnet": "low", "opus": "medium"}
 FOLLOWUP_WAIT_SECONDS = 5         # after Leo asks you something, how long the mic waits for a reply
+# Saying one of these as your whole reply to a follow-up question ends the conversation without
+# asking Claude. Only the whole reply counts, so "no, I have chicken" is still answered.
+STOP_PHRASES = ["stop", "stop listening", "cancel", "never mind", "nevermind", "forget it",
+                "no", "nope", "nah", "no thanks", "no thank you", "nothing", "that's all", "that's it",
+                "i'm done", "i'm good", "we're done", "all done", "i'm all set", "goodbye", "bye"]
+STOP_FILLERS = ["leo", "please", "thanks", "thank you", "okay", "ok"]   # ignored around a stop phrase
 
 APP_DIR = Path.home() / ".hey-claude"
 VOSK_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
@@ -662,6 +668,28 @@ class Ears:
         return text
 
 
+def is_stop_reply(text):
+    """True if a reply to Leo's follow-up question means "we're done": a stop phrase, or just
+    thanks, with optional fillers like "okay" or "Leo" around it. "Okay" alone means yes, so
+    it doesn't count."""
+    t = re.sub(r"[^a-z' ]", " ", text.lower().replace("’", "'"))
+    t = " ".join(t.split())
+    fillers = sorted(STOP_FILLERS, key=len, reverse=True)    # "thank you" before "thanks"
+    trimmed = True
+    while trimmed and t:
+        trimmed = False
+        for f in fillers:
+            if t == f:
+                t, trimmed = "", True
+            elif t.startswith(f + " "):
+                t, trimmed = t[len(f) + 1:], True
+            elif t.endswith(" " + f):
+                t, trimmed = t[:-len(f) - 1], True
+    if not t:
+        return "thank" in text.lower()
+    return t in STOP_PHRASES
+
+
 def is_wake(heard):
     """True if the utterance starts with the wake phrase. Speech before it (a conversation
     in the room) doesn't count, and neither does a longer word like "hey leon"."""
@@ -879,6 +907,11 @@ def session(args):
         question = ears.transcribe(audio)
         if len(question) < 2:
             print("  (couldn't make that out)")
+            continue
+        if was_followup and is_stop_reply(question):     # "no thanks", "stop", "that's all"...
+            print(f"\nYou: {question}\n  (conversation ended)")
+            dbg(f"stop phrase in follow-up reply: {question!r}")
+            ears.beep(440, 120)                           # lower tone: done, back to the wake word
             continue
         followup = handle(question, brain, voice, ears, args.announce, followup=was_followup)
 
