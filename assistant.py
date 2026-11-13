@@ -77,8 +77,9 @@ ANSWER_MAX_TOKENS = 4096
 # How hard each tier thinks (low | medium | high | xhigh | max). Lower is faster to answer.
 EFFORT = {"haiku": "low", "sonnet": "low", "opus": "medium"}
 FOLLOWUP_WAIT_SECONDS = 5         # after Leo asks you something, how long the mic waits for a reply
-# Saying one of these as your whole reply to a follow-up question ends the conversation without
-# asking Claude. Only the whole reply counts, so "no, I have chicken" is still answered.
+# Saying one of these as your whole question (after "Hey Leo") or reply (to a follow-up question)
+# cancels without asking Claude. Only the whole utterance counts, so "no, I have chicken" or
+# "how do I stop a leak" is still answered.
 STOP_PHRASES = ["stop", "stop listening", "cancel", "never mind", "nevermind", "forget it",
                 "no", "nope", "nah", "no thanks", "no thank you", "nothing", "that's all", "that's it",
                 "i'm done", "i'm good", "we're done", "all done", "i'm all set", "goodbye", "bye"]
@@ -908,9 +909,9 @@ def session(args):
         if len(question) < 2:
             print("  (couldn't make that out)")
             continue
-        if was_followup and is_stop_reply(question):     # "no thanks", "stop", "that's all"...
-            print(f"\nYou: {question}\n  (conversation ended)")
-            dbg(f"stop phrase in follow-up reply: {question!r}")
+        if is_stop_reply(question):     # "stop", "never mind", "no thanks"... after the wake word or a follow-up
+            print(f"\nYou: {question}\n  ({'conversation ended' if was_followup else 'cancelled'})")
+            dbg(f"stop phrase instead of a question: {question!r}")
             ears.beep(440, 120)                           # lower tone: done, back to the wake word
             continue
         followup = handle(question, brain, voice, ears, args.announce, followup=was_followup)

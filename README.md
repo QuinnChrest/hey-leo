@@ -85,7 +85,7 @@ Claude (2.1s): Cats purr by rapidly twitching the muscles in their voice box...
 
 Follow-up questions work: "How about dogs?" remembers what you just asked, for up to 5 minutes.
 
-When Leo ends an answer with a question ("Want the steps?"), you'll hear the beep and can answer right away, without saying "Hey Leo". If you stay quiet for 5 seconds (`FOLLOWUP_WAIT_SECONDS`), it goes back to waiting for the wake word. To end the conversation right away, answer with something like "no thanks", "stop", "that's all" or "never mind" (the full list is `STOP_PHRASES`): a low beep confirms, and nothing is sent to Claude. It only counts when that's your whole reply, so "No, I have chicken" still gets an answer.
+When Leo ends an answer with a question ("Want the steps?"), you'll hear the beep and can answer right away, without saying "Hey Leo". If you stay quiet for 5 seconds (`FOLLOWUP_WAIT_SECONDS`), it goes back to waiting for the wake word. To end the conversation right away, answer with something like "no thanks", "stop", "that's all" or "never mind" (the full list is `STOP_PHRASES`): a low beep confirms, and nothing is sent to Claude. The same works right after "Hey Leo" if you change your mind about asking ("Hey Leo." "Yes, Quinn." "Never mind."). It only counts when that's all you say, so "No, I have chicken" or "How do I stop a leaky faucet?" still gets an answer.
 
 ## Conversation log
 
