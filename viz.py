@@ -451,6 +451,39 @@ POSE_FADE = 0.35                    # seconds to crossfade between poses
 ORB_Y = 0.4                         # height of Leo's orb, as a fraction of the window; captions sit below it
 
 
+def _windows_app_id():
+    """Give the window its own taskbar entry (and so Leo's icon) instead of grouping it under python.exe."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HeyLeo.Viz")
+    except Exception:
+        pass
+
+
+def _windows_title_bar(hwnd, bg, fg):
+    """Dark title bar (Windows 10 20H1+), colored to match the window on Windows 11. Best effort."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        dwm = ctypes.windll.dwmapi
+
+        def attr(key, value):
+            v = ctypes.c_uint(value)
+            dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), key, ctypes.byref(v), ctypes.sizeof(v))
+
+        colorref = lambda c: int(c[0]) | int(c[1]) << 8 | int(c[2]) << 16
+        attr(20, 1)                     # DWMWA_USE_IMMERSIVE_DARK_MODE
+        attr(35, colorref(bg))          # DWMWA_CAPTION_COLOR (Windows 11)
+        attr(34, colorref(bg))          # DWMWA_BORDER_COLOR (Windows 11)
+        attr(36, colorref(fg))          # DWMWA_TEXT_COLOR (Windows 11)
+    except Exception:
+        pass
+
+
 class PygameView:
     BG = (11, 13, 20)
 
@@ -470,36 +503,48 @@ class PygameView:
     def open(self):
         pg = self.pg
         pg.init()
-        pg.display.set_caption("Hey Leo")
-        pg.display.set_mode((1000, 660), pg.RESIZABLE)
-        names = "segoeui,helveticaneue,arial,dejavusans"
-        self.f_big = pg.font.SysFont(names, 26, bold=True)
-        self.f_mid = pg.font.SysFont(names, 20)
-        self.f_small = pg.font.SysFont(names, 15, bold=True)
         self.poses, self.pose_imgs = {}, {}
         files = {}
         for name, (file, circle) in AVATARS.items():
             try:
                 if file not in files:
-                    files[file] = pg.image.load(os.path.join(ASSETS, file)).convert()
+                    files[file] = pg.image.load(os.path.join(ASSETS, file))
                 self.poses[name] = (files[file], circle)
             except (OSError, pg.error):
                 pass                    # missing pose: falls back to the portrait, or the plain orb
         self.pose, self.prev_pose, self.pose_since = "portrait", None, 0.0
 
-    def avatar(self, name, radius):
-        """Pose `name` cut to a circle of `radius`, rebuilt only when the size changes."""
+        # window: Leo as the icon, and on Windows his own taskbar entry and a title bar in the viz colors
+        _windows_app_id()
+        if "portrait" in self.poses:
+            pg.display.set_icon(self.circle("portrait", 32))
+        pg.display.set_caption("Hey Leo")
+        pg.display.set_mode((1000, 660), pg.RESIZABLE)
+        _windows_title_bar(pg.display.get_wm_info().get("window"), self.BG, (225, 228, 240))
+
+        names = "segoeui,helveticaneue,arial,dejavusans"
+        self.f_big = pg.font.SysFont(names, 26, bold=True)
+        self.f_mid = pg.font.SysFont(names, 20)
+        self.f_small = pg.font.SysFont(names, 15, bold=True)
+
+    def circle(self, name, radius):
+        """Pose `name` cut to a circle of `radius`, as a new surface with transparent corners."""
         pg = self.pg
+        src, (x, y, r) = self.poses[name]
+        iw, ih = src.get_size()
+        r = min(r, x, y, iw - x, ih - y)
+        img = pg.Surface((radius * 2, radius * 2), pg.SRCALPHA)
+        img.blit(pg.transform.smoothscale(src.subsurface(pg.Rect(x - r, y - r, 2 * r, 2 * r)), img.get_size()), (0, 0))
+        mask = pg.Surface(img.get_size(), pg.SRCALPHA)
+        pg.draw.circle(mask, (255, 255, 255, 255), (radius, radius), radius)
+        img.blit(mask, (0, 0), special_flags=pg.BLEND_RGBA_MIN)
+        return img
+
+    def avatar(self, name, radius):
+        """`circle()` for drawing, rebuilt only when the size changes."""
         img = self.pose_imgs.get(name)
         if img is None or img.get_width() != radius * 2:
-            src, (x, y, r) = self.poses[name]
-            iw, ih = src.get_size()
-            r = min(r, x, y, iw - x, ih - y)
-            img = pg.transform.smoothscale(src.subsurface(pg.Rect(x - r, y - r, 2 * r, 2 * r)), (radius * 2, radius * 2)).convert_alpha()
-            mask = pg.Surface(img.get_size(), pg.SRCALPHA)
-            pg.draw.circle(mask, (255, 255, 255, 255), (radius, radius), radius)
-            img.blit(mask, (0, 0), special_flags=pg.BLEND_RGBA_MIN)
-            self.pose_imgs[name] = img
+            img = self.pose_imgs[name] = self.circle(name, radius).convert_alpha()
         return img
 
     def draw_avatar(self, s, cx, cy, radius, state, t):
